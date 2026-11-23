@@ -1,0 +1,24 @@
+# Binaries / data — live in the Drive project folder, never in git
+*.pt
+*.pth
+*.zip
+*.tar.gz
+sea/
+data/
+checkpoints/
+results/
+figures/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+# Logs / caches / local tooling
+*.log
+.ipynb_checkpoints/
+.DS_Store
+.modal/
+.mypy_cache/
+# Modal / Colab session artefacts
+*.out
