@@ -67,7 +67,7 @@ project Drive folder (see below). This repo is code only.
   Identity is a locally recorded sha256 plus architecture and whether the file
   is a control head or a full finetune checkpoint. Do not call that supervised
   head zero-shot. See `docs/REVISION_2026-11-25.md`.
-- Never fp16; always bf16 autocast.
+- Historical stage scripts always use bf16 autocast. The later fair entry records fp16 plus a GradScaler when the GPU has no bf16, as on a T4. Those historical scripts were not changed.
 
 ## Recipe (final, Stage E)
 

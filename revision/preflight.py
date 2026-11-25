@@ -31,6 +31,7 @@ def environment_report(path="."):
         "disk_free_bytes": int(usage.free),
         "cuda": cuda,
         "bf16": bf16,
+        "fp16": cuda,
         "gpu_name": gpu_name,
         "torch": torch_version,
     }

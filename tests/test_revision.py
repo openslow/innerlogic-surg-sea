@@ -41,6 +41,8 @@ from revision.overlays import (  # noqa: E402
     WRONG_COLOR,
     write_review,
 )
+from revision.backbone_source import SURGFM_COMMIT, probe_status  # noqa: E402
+from revision.checkpoints import classify_checkpoint  # noqa: E402
 from revision.engine import (  # noqa: E402
     TinyDino,
     infer_checkpoint,
@@ -49,6 +51,7 @@ from revision.engine import (  # noqa: E402
     run_synthetic_demo,
     train,
 )
+from revision.manifests import load_official_splits  # noqa: E402
 from revision.preflight import assert_output_ready  # noqa: E402
 from revision.pretrain import ILS_SHA256, decide_weight, resolve_backbone  # noqa: E402
 
@@ -418,12 +421,22 @@ class PretrainAndConfigTests(unittest.TestCase):
         self.assertEqual(cpu_real["device"], "cpu")
         self.assertEqual(cpu_real["launch"], "train")
         self.assertEqual(cpu_real["autocast"], "fp32")
+        t4 = runtime_plan(real=True, cuda=True, bf16=False, device="cuda", fp16=True)
+        self.assertEqual(t4["autocast"], "fp16")
+        self.assertTrue(t4["grad_scaler"])
+        self.assertEqual(t4["precision_reason"], "no_bf16_use_fp16")
+        self.assertEqual(t4["epochs"], 6)
+        self.assertEqual(t4["effective_batch"], 8)
+        self.assertEqual(t4["launch"], "train")
+        self.assertIn("fp16", t4["upstream_fp16_note"])
         with self.assertRaises(RevisionError) as ctx:
-            runtime_plan(real=True, cuda=True, bf16=False, device="cuda")
-        self.assertEqual(ctx.exception.code, "bf16_required")
+            runtime_plan(real=True, cuda=True, bf16=False, device="cuda", precision="bf16")
+        self.assertEqual(ctx.exception.code, "bf16_unavailable")
         real = runtime_plan(real=True, cuda=True, bf16=True, device="cuda")
         self.assertEqual(real["autocast"], "bf16")
+        self.assertFalse(real["grad_scaler"])
         self.assertEqual(real["launch"], "train")
+        self.assertEqual(real["epochs"], 6)
         self.assertIsNone(real["assumed_gpu"])
 
     def test_historical_eval_script_is_unchanged_evidence(self):
@@ -557,7 +570,7 @@ class TrainTests(unittest.TestCase):
                     weight_path=root / "no-weight.pth",
                     expected_sha="abc",
                     data_root=root,
-                    manifest=root / "m.jsonl",
+                    manifest_dir=root / "manifests_paper",
                     out_dir=root,
                     train_mode="frozen_probe",
                     device="cpu",
@@ -569,32 +582,37 @@ class TrainTests(unittest.TestCase):
             digest = __import__("hashlib").sha256(blob.read_bytes()).hexdigest()
             data = root / "data"
             data.mkdir()
-            manifest = root / "m.jsonl"
-            manifest.write_text(
-                '{"image":"a.png","mask":"a.png","cls":"drill","patient":"p","split":"train"}\n'
-                '{"image":"b.png","mask":"b.png","cls":"drill","patient":"q","split":"val"}\n'
+            manifest_dir = root / "manifests_paper"
+            manifest_dir.mkdir()
+            (manifest_dir / "train.jsonl").write_text(
+                '{"image":"a.png","mask":"a.nrrd","cls":"drill","patient":"p","split":"Difficult scenario"}\n'
             )
+            (manifest_dir / "val.jsonl").write_text(
+                '{"image":"b.png","mask":"b.nrrd","cls":"drill","patient":"q","split":"Normal scenario"}\n'
+            )
+            (manifest_dir / "local_test.jsonl").write_text('{"cls":"not-a-class"}\n')
             with self.assertRaises(RevisionError) as ctx:
                 launch_real(
                     backbone_id="dinov3_vitb16_lvd1689m",
                     weight_path=blob,
                     expected_sha=digest,
                     data_root=data,
-                    manifest=manifest,
+                    manifest_dir=manifest_dir,
                     out_dir=root,
                     train_mode="last4_finetune",
                     device="cpu",
                     min_free_bytes=1,
                 )
             self.assertEqual(ctx.exception.code, "backbone_loader_missing")
-            self.assertIn("surgfm_probe", str(ctx.exception))
+            self.assertIn("BLOCKED", str(ctx.exception))
+            self.assertIn(SURGFM_COMMIT, str(ctx.exception))
             with self.assertRaises(RevisionError) as ctx:
                 launch_real(
                     backbone_id="innerlogic_surg_vitb16",
                     weight_path=blob,
                     expected_sha=digest,
                     data_root=data,
-                    manifest=manifest,
+                    manifest_dir=manifest_dir,
                     out_dir=root,
                     train_mode="frozen_probe",
                     device="cuda",
@@ -630,6 +648,131 @@ class TrainTests(unittest.TestCase):
                     root / "fairrun-bad-infer", device="cpu", input_size=16, patch=4,
                 )
             self.assertEqual(ctx.exception.code, "ckpt_kind_mismatch")
+            import torch
+            replay = root / "ep10-like.pt"
+            torch.save({
+                "epoch": 10,
+                "best_val_dice": 0.9643,
+                "history": [],
+                "head_state": {"weight": torch.zeros(7, 768, 1, 1), "bias": torch.zeros(7)},
+                "backbone_state": {"blocks.0.norm1.weight": torch.zeros(768)},
+            }, replay)
+            digest = __import__("hashlib").sha256(replay.read_bytes()).hexdigest()
+            with self.assertRaises(RevisionError) as ctx:
+                launch_real(
+                    backbone_id="innerlogic_surg_vitb16",
+                    weight_path=replay,
+                    expected_sha=digest,
+                    data_root=data,
+                    manifest_dir=manifest_dir,
+                    out_dir=root,
+                    train_mode="frozen_probe",
+                    device="cpu",
+                    min_free_bytes=1,
+                )
+            self.assertEqual(ctx.exception.code, "pretrain_expected")
+            self.assertEqual(ctx.exception.details["use"], "inference_replay")
+
+    def test_precision_scaler_resume_and_public_protocols(self):
+        import torch
+        self.assertFalse((ROOT / "surgfm_probe").exists())
+        status = probe_status()
+        self.assertTrue(status["blocked"])
+        self.assertEqual(status["code"], "BLOCKED")
+        self.assertFalse(status["vendored"])
+        self.assertEqual(status["expected_commit"], SURGFM_COMMIT)
+        official = load_official_splits(ROOT / "manifests_paper")
+        self.assertEqual(len(official["train"]), 8057)
+        self.assertEqual(len(official["val"]), 496)
+        self.assertNotIn("local_test", official)
+        first = official["train"][0]
+        self.assertEqual(first["partition"], "train")
+        self.assertEqual(first["difficulty"], first["split"])
+        self.assertIn(first["difficulty"], {"Difficult scenario", "Normal scenario"})
+        again = load_official_splits(ROOT / "manifests_paper")
+        self.assertEqual(
+            [row["image"] for row in official["train"]],
+            [row["image"] for row in again["train"]],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td)
+            (bad / "train.jsonl").write_text('{"image":"a.png","mask":"a.nrrd","patient":"p"}\n')
+            (bad / "val.jsonl").write_text(
+                '{"image":"b.png","mask":"b.nrrd","cls":"drill","patient":"q","split":"Normal scenario"}\n'
+            )
+            with self.assertRaises(RevisionError) as ctx:
+                load_official_splits(bad)
+            self.assertEqual(ctx.exception.code, "manifest_field_missing")
+
+        pretrain = {
+            "cls_token": torch.zeros(1, 1, 768),
+            "patch_embed.proj.weight": torch.zeros(768, 3, 16, 16),
+        }
+        self.assertEqual(classify_checkpoint(pretrain)["use"], "new_training_backbone")
+        ep10 = {
+            "epoch": 10,
+            "best_val_dice": 0.9643,
+            "history": [],
+            "head_state": {"weight": torch.zeros(7, 768, 1, 1), "bias": torch.zeros(7)},
+            "backbone_state": {"cls_token": torch.zeros(1, 1, 768)},
+        }
+        replay = classify_checkpoint(ep10)
+        self.assertEqual(replay["use"], "inference_replay")
+        self.assertEqual(replay["ckpt_kind"], "full_finetune")
+        self.assertFalse(replay["has_opt_state"])
+        self.assertFalse(replay["new_training_loads_this_file"])
+        control = {"epoch": 3, "head_state": ep10["head_state"]}
+        self.assertEqual(classify_checkpoint(control)["ckpt_kind"], "control_head")
+        fair = {
+            "epoch": 1,
+            "optimizer_step": 1,
+            "sched_state": {},
+            "rng_state": {},
+            "head_state": ep10["head_state"],
+        }
+        self.assertEqual(classify_checkpoint(fair)["use"], "fair_resume")
+
+        cfg = training_matrix_one()
+        cfg["autocast"] = "fp16"
+        cfg["grad_scaler"] = True
+        rows_train = _rows("train")
+        rows_val = _rows("val")
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            torch.manual_seed(int(cfg["seed"]))
+            seed_net = TinyDino()
+            full = train(
+                cfg, rows_train, rows_val, _clone(seed_net), parent, "fairrun-fp16-full",
+                device="cpu", max_optimizer_steps=2, val_every="optimizer_step",
+            )
+            part = train(
+                cfg, rows_train, rows_val, _clone(seed_net), parent, "fairrun-fp16-part",
+                device="cpu", max_optimizer_steps=1, val_every="optimizer_step",
+            )
+            resumed = train(
+                cfg, rows_train, rows_val, _clone(seed_net), parent, "fairrun-fp16-part",
+                device="cpu", max_optimizer_steps=1, resume=True, val_every="optimizer_step",
+            )
+            full_blob = torch.load(Path(full["run_dir"]) / "last.pt", map_location="cpu", weights_only=False)
+            part_blob = torch.load(Path(resumed["run_dir"]) / "last.pt", map_location="cpu", weights_only=False)
+            self.assertEqual(full["autocast"], "fp16")
+            self.assertTrue(full["grad_scaler"])
+            self.assertEqual(full_blob["scaler_state"], part_blob["scaler_state"])
+            self.assertTrue(
+                full_blob["scaler_state"]["_growth_tracker"] > 0
+                or full_blob["scaler_state"]["scale"] < 65536.0
+            )
+            self.assertEqual(resumed["optimizer_steps"], 2)
+            self.assertTrue(torch.allclose(
+                full_blob["head_state"]["weight"], part_blob["head_state"]["weight"], atol=1e-4,
+            ))
+            self.assertFalse(torch.cuda.is_available())
+
+
+def _clone(net):
+    fresh = TinyDino(embed=net.embed_dim, depth=net.depth, patch=net.patch_size)
+    fresh.load_state_dict(net.state_dict())
+    return fresh
 
 
 def training_matrix_one():

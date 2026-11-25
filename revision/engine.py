@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +11,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from revision.backbone_source import require_official_loader
+from revision.checkpoints import classify_checkpoint
 from revision.fair_config import runtime_plan, select_epoch, training_matrix
 from revision.identity import RevisionError, create_run_dir, verify_identity
+from revision.manifests import load_official_splits
 from revision.metrics import CLS_NAMES, score_mask
 from revision.overlays import write_review
 from revision.preflight import assert_output_ready
@@ -278,11 +282,23 @@ def evaluate_split(backbone, head, rows, *, input_size, patch, device, split):
     }
 
 
+def _row_partition(row):
+    if row.get("partition"):
+        return row["partition"]
+    return row.get("split")
+
+
 def _ckpt_kind(mode):
     return "control_head" if mode == "frozen_probe" else "full_finetune"
 
 
-def _pack_checkpoint(backbone, head, mode, opt, sched, history, best, config, step):
+def _make_scaler(precision, device):
+    enabled = precision == "fp16"
+    scaler_device = "cuda" if getattr(device, "type", device) == "cuda" and torch.cuda.is_available() else "cpu"
+    return torch.amp.GradScaler(scaler_device, enabled=enabled)
+
+
+def _pack_checkpoint(backbone, head, mode, opt, sched, scaler, history, best, config, step):
     blob = {
         "epoch": int(history[-1]["epoch"]) if history else -1,
         "optimizer_step": int(step),
@@ -294,6 +310,7 @@ def _pack_checkpoint(backbone, head, mode, opt, sched, history, best, config, st
         "head_state": {k: v.detach().cpu() for k, v in head.state_dict().items()},
         "opt_state": opt.state_dict(),
         "sched_state": sched.state_dict(),
+        "scaler_state": scaler.state_dict(),
         "rng_state": _capture_rng(),
         "config": config,
         "ckpt_kind": _ckpt_kind(mode),
@@ -346,7 +363,7 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
         )
     if config.get("selection_split") != "val":
         raise RevisionError("test_leak", "selection_split 必须是 val", {})
-    if any(row.get("split") in {"test", "local_test", "external_test"} for row in list(train_rows) + list(val_rows)):
+    if any(_row_partition(row) in {"test", "local_test", "external_test", "old100"} for row in list(train_rows) + list(val_rows)):
         raise RevisionError("test_leak", "train/val 列表里混入了独立测试划分", {})
     parent = Path(parent)
     mode = config["train_mode"]
@@ -374,9 +391,12 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
         raise RevisionError("batch_mismatch", "这一版的微批固定为 1，再用梯度累积凑有效 batch。", {})
     steps_per_epoch = max(1, math.ceil(len(train_rows) / int(config["effective_batch"])))
     sched = _scheduler(opt, steps_per_epoch, int(config["epochs"]))
-    autocast = device.type == "cuda"
-    if config.get("fp16_forbidden") and config.get("autocast") == "fp16":
-        raise RevisionError("fp16_forbidden", "禁止 fp16。", {})
+    precision = config.get("autocast") or "fp32"
+    if precision == "fp16" and not config.get("grad_scaler"):
+        raise RevisionError("scaler_required", "fp16 必须带 GradScaler，并把它的状态写进断点。", {})
+    if precision == "bf16" and device.type != "cuda":
+        raise RevisionError("precision_unavailable", "bf16 只在 CUDA 上使用。", {})
+    scaler = _make_scaler(precision, device)
 
     if resume:
         run = parent / run_name
@@ -387,14 +407,24 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
             raise RevisionError("resume_forbidden", "断点配置和当前运行不一致", {})
         if blob.get("ckpt_kind") != _ckpt_kind(mode):
             raise RevisionError("ckpt_kind_mismatch", "断点种类和 train_mode 不一致", {})
-        if blob.get("continued_from_ep10"):
+        if blob.get("continued_from_ep10") or int(blob.get("epoch", -1)) >= 10:
             raise RevisionError("resume_forbidden", "不能从 ep10 历史微调续训", {})
+        saved_precision = (blob.get("config") or {}).get("autocast") or "fp32"
+        if saved_precision != precision:
+            raise RevisionError(
+                "resume_forbidden",
+                "断点精度和当前运行不一致",
+                {"found": saved_precision, "expected": precision},
+            )
+        if "scaler_state" not in blob:
+            raise RevisionError("incomplete_metadata", "断点没有 scaler_state", {})
         head.load_state_dict(blob["head_state"])
         if mode == "last4_finetune":
             backbone.load_state_dict(blob["backbone_state"])
         apply_train_mode(backbone, mode)
         opt.load_state_dict(blob["opt_state"])
         sched.load_state_dict(blob["sched_state"])
+        scaler.load_state_dict(blob["scaler_state"])
         _restore_rng(blob["rng_state"])
         history = list(blob["history"])
         step = int(blob["optimizer_step"])
@@ -423,23 +453,28 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
         prepared = prepare_sample(row, input_size, patch, augment=True)
         images = prepared["tensor"].unsqueeze(0).to(device)
         labels = prepared["labels"].unsqueeze(0).to(device)
-        if autocast:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                logits = head(forward_dense(backbone, images))
-                loss = _loss(logits, labels) / accum
+        if precision == "fp32":
+            cast = nullcontext()
         else:
+            dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+            cast = torch.autocast(device.type, dtype=dtype)
+        with cast:
             logits = head(forward_dense(backbone, images))
             loss = _loss(logits, labels) / accum
-        loss.backward()
+        scaler.scale(loss).backward()
         backwards += 1
         pending += 1
         if grad_probe is None:
             grad_probe = _grad_report(backbone, head)
         if pending < accum:
             continue
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_([p for group in opt.param_groups for p in group["params"]], 1.0)
-        opt.step()
-        sched.step()
+        scale_before = float(scaler.get_scale())
+        scaler.step(opt)
+        scaler.update()
+        if float(scaler.get_scale()) >= scale_before:
+            sched.step()
         opt.zero_grad(set_to_none=False)
         pending = 0
         step += 1
@@ -461,11 +496,11 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
             if metrics["binary_foreground_dice"] > best["score"]:
                 best = {"step": int(step), "score": metrics["binary_foreground_dice"]}
                 _save_blob(
-                    _pack_checkpoint(backbone, head, mode, opt, sched, history, best, config, step),
+                    _pack_checkpoint(backbone, head, mode, opt, sched, scaler, history, best, config, step),
                     run / "best.pt",
                 )
         _save_blob(
-            _pack_checkpoint(backbone, head, mode, opt, sched, history, best, config, step),
+            _pack_checkpoint(backbone, head, mode, opt, sched, scaler, history, best, config, step),
             run / "last.pt",
         )
     scores = {
@@ -486,6 +521,8 @@ def train(config, train_rows, val_rows, backbone, parent, run_name, *,
         "history": [{k: v for k, v in item.items() if k != "frames"} for item in history],
         "grad_probe": grad_probe,
         "synthetic_backbone": bool(config.get("synthetic_backbone")),
+        "autocast": precision,
+        "grad_scaler": bool(config.get("grad_scaler")),
     }
 
 
@@ -582,6 +619,7 @@ def synthetic_config(base, input_size=16, patch=4, embed=8):
     config["patch_size_runtime"] = patch
     config["synthetic_backbone"] = True
     config["autocast"] = "fp32"
+    config["grad_scaler"] = False
     return config
 
 
@@ -661,6 +699,7 @@ def _resume_matches(parent, optimizer_steps=2):
     full_blob = torch.load(Path(full["run_dir"]) / "last.pt", map_location="cpu", weights_only=False)
     part_blob = torch.load(Path(resumed["run_dir"]) / "last.pt", map_location="cpu", weights_only=False)
     same = torch.allclose(full_blob["head_state"]["weight"], part_blob["head_state"]["weight"], atol=1e-5)
+    scaler_same = full_blob.get("scaler_state") == part_blob.get("scaler_state")
     kept = marker.read_text() == "keep"
     opt_same = torch.allclose(
         full_blob["opt_state"]["state"][0]["exp_avg"],
@@ -668,7 +707,7 @@ def _resume_matches(parent, optimizer_steps=2):
         atol=1e-5,
     )
     return bool(
-        same and opt_same and kept
+        same and opt_same and scaler_same and kept
         and resumed["optimizer_steps"] == int(optimizer_steps)
         and full_blob["sched_state"]["last_epoch"] == part_blob["sched_state"]["last_epoch"]
     )
@@ -721,45 +760,51 @@ def _infer_demo(parent):
     )
 
 
-def launch_real(*, backbone_id, weight_path, expected_sha, data_root, manifest, out_dir,
-                train_mode, device="cpu", seed=7, min_free_bytes=1 << 30, run_name=None):
-    """用户本地权重和数据上的真实入口。缺文件、不可写、无 bf16 GPU 时立刻停下。"""
+def _saved_object(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+
+
+def launch_real(*, backbone_id, weight_path, expected_sha, data_root, manifest_dir, out_dir,
+                train_mode, device="cpu", seed=7, precision="auto", min_free_bytes=1 << 30, run_name=None):
+    """用户本地预训练权重和 manifests_paper 目录上的新训练。不从 ep10 续。"""
     cuda = torch.cuda.is_available()
     bf16 = bool(cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)())
-    plan = runtime_plan(True, cuda, bf16, device=device)
+    fp16 = bool(cuda)
+    plan = runtime_plan(True, cuda, bf16, device=device, precision=precision, fp16=fp16)
     assert_output_ready(out_dir, min_free_bytes)
     if not expected_sha:
         raise RevisionError(
             "expected_sha_required",
-            "把本地核过的 sha256 填进 manifest。仓库不代存私有哈希。",
+            "把本地核过的 sha256 填进配置。仓库不代存私有哈希。",
             {"steps_zh": _STEPS.get(backbone_id, "")},
         )
     resolve_backbone(backbone_id, weight_path, expected_sha=expected_sha)
+    saved = _saved_object(weight_path)
+    if isinstance(saved, dict) and "head_state" in saved:
+        info = classify_checkpoint(saved)
+        raise RevisionError(
+            "pretrain_expected",
+            "这是训练 checkpoint，不是 load_backbone 要的扁平 DINOv3 预训练权重。"
+            "推理重放另走 head_state；新训练不要从这份文件续。",
+            info,
+        )
     root = Path(data_root) if data_root else None
-    manifest_path = Path(manifest) if manifest else None
     if root is None or not root.is_dir():
         raise RevisionError("data_missing", "数据根目录不存在", {"path": None if root is None else str(root)})
-    if manifest_path is None or not manifest_path.is_file():
-        raise RevisionError("manifest_missing", "manifest jsonl 不存在", {"path": None if manifest_path is None else str(manifest_path)})
-    rows = [json.loads(line) for line in manifest_path.read_text().splitlines() if line.strip()]
-    for row in rows:
-        row["root"] = str(root)
-    train_rows = [row for row in rows if row.get("split") == "train"]
-    val_rows = [row for row in rows if row.get("split") == "val"]
-    if not train_rows or not val_rows:
-        raise RevisionError("split_missing", "manifest 需要 train 和 val。test 不会被读取。", {})
-    try:
-        from surgfm_probe import load_backbone
-    except ImportError as exc:
-        raise RevisionError(
-            "backbone_loader_missing",
-            "需要把 InnerLogic-Surg 的 surgfm_probe 放到 PYTHONPATH。"
-            "本函数不下载权重，也不用别的结构冒充 ViT-B/16。",
-            {"steps_zh": _STEPS.get(backbone_id, "")},
-        ) from exc
+    splits = load_official_splits(manifest_dir, roles=("train", "val"))
+    for role, rows in splits.items():
+        for row in rows:
+            row["root"] = str(root)
+    require_official_loader()
+    from surgfm_probe import load_backbone
     backbone = load_backbone(str(weight_path), device=device)
     if not hasattr(backbone, "blocks") or len(list(backbone.blocks)) != 12:
         raise RevisionError("architecture_mismatch", "骨干不是 12-block ViT-B/16 接口", {})
+    if int(getattr(backbone, "embed_dim", 0)) != 768:
+        raise RevisionError("architecture_mismatch", "公平对比只要 embed 768 的 ViT-B/16", {})
     base = next(item for item in training_matrix(phase="single", seed=seed)
                 if item["backbone_id"] == backbone_id and item["train_mode"] == train_mode)
     base = dict(base)
@@ -767,8 +812,11 @@ def launch_real(*, backbone_id, weight_path, expected_sha, data_root, manifest, 
     base["patch_size_runtime"] = 16
     base["synthetic_backbone"] = False
     base["autocast"] = plan["autocast"]
+    base["grad_scaler"] = plan["grad_scaler"]
+    base["precision_reason"] = plan["precision_reason"]
+    base["upstream_fp16_note"] = plan.get("upstream_fp16_note")
     name = run_name or ("fairrun-real-" + train_mode)
     return train(
-        base, train_rows, val_rows, backbone, out_dir, name,
+        base, splits["train"], splits["val"], backbone, out_dir, name,
         device=device, val_every="epoch",
     )

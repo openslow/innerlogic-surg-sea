@@ -51,8 +51,7 @@ def training_matrix(phase="single", seed=7):
                     "grad_accum": 8,
                     "lr_backbone": None if mode == "frozen_probe" else 1e-5,
                     "lr_head": 1e-4,
-                    "autocast": "bf16",
-                    "fp16_forbidden": True,
+                    "precision_policy": "auto",
                     "selection_split": "val",
                     # Stage E val_dice：帧等权 binary foreground。semantic 只记录，不选点。
                     "selection_score": "binary_foreground_dice_frame_equal",
@@ -102,17 +101,82 @@ def select_epoch(val_scores):
     return min(val_scores, key=lambda epoch: (-float(val_scores[epoch]), epoch))
 
 
-def runtime_plan(real, cuda, bf16, device="cpu"):
-    """device 默认 cpu。只有调用方写明 cuda 才会用 GPU，并且那时要求 bf16。"""
+def choose_precision(device, cuda, bf16, requested="auto", fp16=None):
+    """按设备和请求选精度。不改 epoch、有效 batch 或几何。
+
+    auto：有 bf16 用 bf16；CUDA 但没有 bf16（T4）用 fp16 加 GradScaler；否则 fp32。
+    点名 bf16 而卡不支持时直接失败，不偷偷改成别的精度。
+    """
+    if device not in ("cpu", "cuda"):
+        raise RevisionError("bad_device", "device 只能是 cpu 或 cuda", {"device": device})
+    if requested not in ("auto", "bf16", "fp16", "fp32"):
+        raise RevisionError("bad_precision", "precision 只能是 auto、bf16、fp16 或 fp32", {"precision": requested})
+    if fp16 is None:
+        fp16 = bool(device == "cuda" and cuda)
+    budget = {"epochs": 6, "effective_batch": 8, "geometry": "square768"}
+    if device == "cpu":
+        if requested not in ("auto", "fp32"):
+            raise RevisionError(
+                "precision_unavailable",
+                "CPU 路径固定 fp32。fp16 或 bf16 只在 CUDA 上选择。",
+                {"requested": requested, "budget": budget},
+            )
+        return {
+            "autocast": "fp32",
+            "grad_scaler": False,
+            "precision_reason": "cpu",
+            "budget": budget,
+        }
+    if requested == "bf16" or (requested == "auto" and bf16):
+        if not bf16:
+            raise RevisionError(
+                "bf16_unavailable",
+                "这张卡没有 bf16。T4 请用 precision=auto 或 fp16，不要点名 bf16。",
+                {"cuda": cuda, "bf16": bf16, "budget": budget},
+            )
+        return {
+            "autocast": "bf16",
+            "grad_scaler": False,
+            "precision_reason": "bf16_supported",
+            "budget": budget,
+        }
+    if requested == "fp32" or (requested == "auto" and not fp16):
+        return {
+            "autocast": "fp32",
+            "grad_scaler": False,
+            "precision_reason": "explicit_fp32" if requested == "fp32" else "no_reduced_precision",
+            "budget": budget,
+        }
+    if not fp16:
+        raise RevisionError(
+            "fp16_unavailable",
+            "要求 fp16，但这张卡没有 fp16。",
+            {"cuda": cuda, "fp16": fp16, "budget": budget},
+        )
+    return {
+        "autocast": "fp16",
+        "grad_scaler": True,
+        "precision_reason": "no_bf16_use_fp16",
+        "upstream_fp16_note": (
+            "Innerlogic-Surg v0.1.0 的 README 写这个骨干 fp16 会溢出，并推荐 bfloat16。"
+            "T4 没有 bf16，所以这里显式用 fp16 加 GradScaler。epoch、有效 batch 和几何不改。"
+        ),
+        "budget": budget,
+    }
+
+
+def runtime_plan(real, cuda, bf16, device="cpu", precision="auto", fp16=None):
+    """device 默认 cpu。只有调用方写明 cuda 才会用 GPU。精度按卡选择，不强制 bf16。"""
     if device not in ("cpu", "cuda"):
         raise RevisionError("bad_device", "device 只能是 cpu 或 cuda", {"device": device})
     plan = {
         "microbatch": 1,
         "grad_accum": 8,
         "effective_batch": 8,
+        "epochs": 6,
         "assumed_gpu": None,
-        "fp16_forbidden": True,
         "device": device,
+        "precision_requested": precision,
     }
     if device == "cuda":
         if not real:
@@ -127,15 +191,7 @@ def runtime_plan(real, cuda, bf16, device="cpu"):
                 "要求使用 CUDA，但这台机器没有可用 GPU。",
                 {"cuda": cuda, "bf16": bf16},
             )
-        if not bf16:
-            raise RevisionError(
-                "bf16_required",
-                "CUDA 上的公平对比只用 bf16。不改用 fp16，也不默认某张卡。",
-                {"cuda": cuda, "bf16": bf16, "assumed_gpu": None},
-            )
-        plan["autocast"] = "bf16"
-        plan["launch"] = "train"
-        return plan
-    plan["autocast"] = "fp32"
-    plan["launch"] = "train" if real else "cpu_smoke"
+    chosen = choose_precision(device, cuda, bf16, precision, fp16=fp16)
+    plan.update(chosen)
+    plan["launch"] = "train" if (device == "cuda" or real) else "cpu_smoke"
     return plan

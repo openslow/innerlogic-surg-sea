@@ -1,4 +1,5 @@
-# CPU 合成与 Colab 入口的版本钉。GPU 机器改用对应的 CUDA wheel，不要装 fp16 专用包。
+# CPU 合成与 Colab 入口的 Python 依赖。GPU 机器改用对应的 CUDA wheel。
+# surgfm-probe 不在这里：它是 Innerlogic-Surg v0.1.0 的外部源码，见 revision/backbone_source.py。
 # 安装：pip install -r requirements-fair.txt --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.1
 torchvision==0.20.1

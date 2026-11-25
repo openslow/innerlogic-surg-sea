@@ -121,7 +121,7 @@ MyDrive/ILS-Colab/                <- 建议的 Drive 目录（本次未创建，
 上文里的 L4 时长和续训步骤是 11-22 的历史记录，不是四组新实验的硬件保证。新入口是仓库里的 `notebooks/fair_comparison_entry.ipynb`：
 
 - 默认 `MOUNT_DRIVE = False`、`DEVICE = "cpu"`、`RUN_REAL = False`。CPU 路径会跑合成 smoke，并调用 `run_synthetic_demo` 做极小训练、断点恢复和一轮推理。
-- `RUN_REAL = True` 才调用 `launch_real`。它需要本地权重、调用方自己记下的 sha256、数据根和 manifest。指定 `DEVICE = "cuda"` 时还要求 bf16，不会自动改用 fp16，也不会因为机器有 GPU 就自己切过去。
+- `RUN_REAL = True` 才调用 `launch_real`。它需要本地预训练权重、调用方自己记下的 sha256、数据根，以及 `manifests_paper` 目录。`DEVICE` 默认 cpu。写成 cuda 时按卡选 bf16，或在没有 bf16 的 T4 上选 fp16 加 GradScaler。点名 bf16 而卡不支持会停下。历史脚本仍是 bf16，这一节不改那些脚本。
 - 第一格打印 `hostname`。若手动把挂载打开，挂完再打印一次，两次相同才算同一台 VM。
 - 检查输出路径是否可写、剩余磁盘。不够就停。真实权重只接受本地路径；sha 对不上就停。
 - 依赖安装命令和版本钉在笔记本与 `requirements-fair.txt`。`INSTALL_DEPS` 默认关闭。
