@@ -115,3 +115,14 @@ MyDrive/ILS-Colab/                <- 建议的 Drive 目录（本次未创建，
 - **持久性证明已完成（2026-11-23 23:05）**：旧运行时 0d1a47364fe4 断开删除后，新运行时 55b963c02ae5 二次挂载，读回 marker 时间戳 2026-11-23T14:59:49Z 逐字一致（marker 内记的 runtime 与新 hostname 不同，确为旧运行时所写），随后 marker 已删。结论：**Drive 当持久 volume 的路子走通了**，会话丢了文件不丢。
 - **二次挂载不用手机验证**：第一次挂载 Google 要求手机点 Yes + 数字（54、29 两次）；新运行时二次挂载只点了两次 Continue，全程无手机验证——应用授权一次之后就省事了。
 - **环境不存 Drive（2026-11-23 确认）**：标准做法是数据、笔记本、代码、requirements.txt、检查点放 Drive，环境本身不放。Colab 基础镜像自带 torch 等常见库，新会话 pip 重装一般只要几分钟；11-22 那晚重建烧钱的根因是 9.8GB 数据集每次重下 + 检查点分块重传，不是环境重建。只在依赖需要编译（flash-attn、自定义 CUDA 扩展）或大体积冷门 wheel 时，才值得把 wheel 文件缓存在 Drive 里离线装；直接 `pip install --target` 装到 Drive 里一般不推荐，Drive 是 FUSE，几千个小文件 import 很慢。
+
+## 11. 2026-11-25 公平对比入口
+
+上文里的 L4 时长和续训步骤是 11-22 的历史记录，不是四组新实验的硬件保证。新入口是仓库里的 `notebooks/fair_comparison_entry.ipynb`：
+
+- 默认 `MOUNT_DRIVE = False`、`DEVICE = "cpu"`、`RUN_REAL = False`。CPU 路径会跑合成 smoke，并调用 `run_synthetic_demo` 做极小训练、断点恢复和一轮推理。
+- `RUN_REAL = True` 才调用 `launch_real`。它需要本地预训练权重、调用方自己记下的 sha256、数据根，以及 `manifests_paper` 目录。`DEVICE` 默认 cpu。写成 cuda 时按卡选 bf16，或在没有 bf16 的 T4 上选 fp16 加 GradScaler。点名 bf16 而卡不支持会停下。历史脚本仍是 bf16，这一节不改那些脚本。
+- 第一格打印 `hostname`。若手动把挂载打开，挂完再打印一次，两次相同才算同一台 VM。
+- 检查输出路径是否可写、剩余磁盘。不够就停。真实权重只接受本地路径；sha 对不上就停。
+- 依赖安装命令和版本钉在笔记本与 `requirements-fair.txt`。`INSTALL_DEPS` 默认关闭。
+- `colab_probe.py` 与 `colab_loader_test.py` 仍只是旧的环境探测，不是这个入口。不要从 ep10 续训来填这四组。
