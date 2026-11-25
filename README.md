@@ -11,6 +11,16 @@ Best checkpoint is **ep10**: local test Dice **0.9643**, external test **0.9677*
 clean22 **0.9754** (paper's nnU-Net: 0.9753 / 0.9376 — ours beats it on external,
 trails on local; protocol-aligned reproduction, patient IDs differ from the paper).
 
+**研究修订（2026-11-25，不改上面的历史数字）.** 上面三个 Dice 是 binary
+foreground（`pred != 0`），不是 class-aware Dice。clean22 是 old100 里患者不在
+新训练集的子集，不是独立测试集。冻结骨干再监督训练 head 不是 zero-shot。
+ep10 微调预算长于 Stage E control，且 B–D 用的是 768×432 stretch。
+名为 `best_control.pt`、binary val 0.8682456 的文件是旧 B2，不是 Stage E
+control（0.9394298）；正确 head 未钉死 sha 之前会 fail-fast。
+逐帧 control JSON 的体积路径是 `results_e/results_control.json`，本仓库不收录该文件。
+口径、四组公平配置和 Colab 入口见 `docs/REVISION_2026-11-25.md` 与
+`notebooks/fair_comparison_entry.ipynb`。历史训练脚本未改。
+
 Data, checkpoints, results and figures are **not** in this repo — they live in the
 project Drive folder (see below). This repo is code only.
 
@@ -49,9 +59,13 @@ project Drive folder (see below). This repo is code only.
   elsewhere; do not assume `/root` or `/home/hatch` exists.
 - `verify_*.py` scripts read per-frame result JSONs by absolute local path;
   point them at the `results/` files from the Drive folder.
-- `best_control.pt` (0-shot control) is **head-only** (68 KB). Rebuilding the
-  control model requires the pretrain weight — see `checkpoints/MANIFEST.md`
-  in the Drive folder.
+- A file named `best_control.pt` is **not an identity**. The head-only 68 KB
+  note in earlier notes referred to a frozen-backbone head; the copy whose
+  binary val Dice is 0.8682456 is the old B2 epoch-3 stretch head, not the
+  Stage E control (binary val 0.9394298). Do not call that supervised head
+  zero-shot. Rebuilding either head still needs the matching pretrain weight
+  and a manifest (`checkpoints/MANIFEST.md` on Drive). This repo fails closed
+  until that metadata matches. See `docs/REVISION_2026-11-25.md`.
 - Never fp16; always bf16 autocast.
 
 ## Recipe (final, Stage E)

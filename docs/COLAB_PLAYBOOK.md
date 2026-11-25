@@ -115,3 +115,13 @@ MyDrive/ILS-Colab/                <- 建议的 Drive 目录（本次未创建，
 - **持久性证明已完成（2026-11-23 23:05）**：旧运行时 0d1a47364fe4 断开删除后，新运行时 55b963c02ae5 二次挂载，读回 marker 时间戳 2026-11-23T14:59:49Z 逐字一致（marker 内记的 runtime 与新 hostname 不同，确为旧运行时所写），随后 marker 已删。结论：**Drive 当持久 volume 的路子走通了**，会话丢了文件不丢。
 - **二次挂载不用手机验证**：第一次挂载 Google 要求手机点 Yes + 数字（54、29 两次）；新运行时二次挂载只点了两次 Continue，全程无手机验证——应用授权一次之后就省事了。
 - **环境不存 Drive（2026-11-23 确认）**：标准做法是数据、笔记本、代码、requirements.txt、检查点放 Drive，环境本身不放。Colab 基础镜像自带 torch 等常见库，新会话 pip 重装一般只要几分钟；11-22 那晚重建烧钱的根因是 9.8GB 数据集每次重下 + 检查点分块重传，不是环境重建。只在依赖需要编译（flash-attn、自定义 CUDA 扩展）或大体积冷门 wheel 时，才值得把 wheel 文件缓存在 Drive 里离线装；直接 `pip install --target` 装到 Drive 里一般不推荐，Drive 是 FUSE，几千个小文件 import 很慢。
+
+## 11. 2026-11-25 公平对比入口
+
+上文里的 L4 时长和续训步骤是 11-22 的历史记录，不是四组新实验的硬件保证。新入口是仓库里的 `notebooks/fair_comparison_entry.ipynb`：
+
+- 默认 `MOUNT_DRIVE = False`、`RUN_REAL = False`，只跑 CPU 合成 smoke。
+- 第一格打印 `hostname`。若手动把挂载打开，挂完再打印一次，两次相同才算同一台 VM。
+- 检查输出路径是否存在、剩余磁盘，并做 GPU / bf16 预检。没有 bf16 不做真实对比，也不改用 fp16。
+- 日志和样例写到笔记本里配置的目录。真实权重只接受本地路径；对不上 manifest 就停。
+- `colab_probe.py` 与 `colab_loader_test.py` 仍只是旧的环境探测，不是这个入口。不要从 ep10 续训来填这四组。
