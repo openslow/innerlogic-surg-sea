@@ -120,8 +120,9 @@ MyDrive/ILS-Colab/                <- 建议的 Drive 目录（本次未创建，
 
 上文里的 L4 时长和续训步骤是 11-22 的历史记录，不是四组新实验的硬件保证。新入口是仓库里的 `notebooks/fair_comparison_entry.ipynb`：
 
-- 默认 `MOUNT_DRIVE = False`、`RUN_REAL = False`，只跑 CPU 合成 smoke。
+- 默认 `MOUNT_DRIVE = False`、`DEVICE = "cpu"`、`RUN_REAL = False`。CPU 路径会跑合成 smoke，并调用 `run_synthetic_demo` 做极小训练、断点恢复和一轮推理。
+- `RUN_REAL = True` 才调用 `launch_real`。它需要本地权重、调用方自己记下的 sha256、数据根和 manifest。指定 `DEVICE = "cuda"` 时还要求 bf16，不会自动改用 fp16，也不会因为机器有 GPU 就自己切过去。
 - 第一格打印 `hostname`。若手动把挂载打开，挂完再打印一次，两次相同才算同一台 VM。
-- 检查输出路径是否存在、剩余磁盘，并做 GPU / bf16 预检。没有 bf16 不做真实对比，也不改用 fp16。
-- 日志和样例写到笔记本里配置的目录。真实权重只接受本地路径；对不上 manifest 就停。
+- 检查输出路径是否可写、剩余磁盘。不够就停。真实权重只接受本地路径；sha 对不上就停。
+- 依赖安装命令和版本钉在笔记本与 `requirements-fair.txt`。`INSTALL_DEPS` 默认关闭。
 - `colab_probe.py` 与 `colab_loader_test.py` 仍只是旧的环境探测，不是这个入口。不要从 ep10 续训来填这四组。

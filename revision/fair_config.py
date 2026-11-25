@@ -54,7 +54,12 @@ def training_matrix(phase="single", seed=7):
                     "autocast": "bf16",
                     "fp16_forbidden": True,
                     "selection_split": "val",
-                    "selection_score": "frame_equal_mean_gt_class_dice",
+                    # Stage E val_dice：帧等权 binary foreground。semantic 只记录，不选点。
+                    "selection_score": "binary_foreground_dice_frame_equal",
+                    "selection_protocol": "stage_e_binary_foreground_frame_equal_val",
+                    "reported_but_not_used_for_selection": [
+                        "gt_class_dice", "class_aware_macro_dice", "naming_accuracy",
+                    ],
                     "resume_from_ep10": False,
                     "seed": one_seed,
                     "seeds": [one_seed],
@@ -97,24 +102,40 @@ def select_epoch(val_scores):
     return min(val_scores, key=lambda epoch: (-float(val_scores[epoch]), epoch))
 
 
-def runtime_plan(real, cuda, bf16):
+def runtime_plan(real, cuda, bf16, device="cpu"):
+    """device 默认 cpu。只有调用方写明 cuda 才会用 GPU，并且那时要求 bf16。"""
+    if device not in ("cpu", "cuda"):
+        raise RevisionError("bad_device", "device 只能是 cpu 或 cuda", {"device": device})
     plan = {
         "microbatch": 1,
         "grad_accum": 8,
         "effective_batch": 8,
         "assumed_gpu": None,
         "fp16_forbidden": True,
+        "device": device,
     }
-    if not real:
-        plan["autocast"] = "disabled_cpu_smoke"
-        plan["launch"] = "refused_not_real"
+    if device == "cuda":
+        if not real:
+            raise RevisionError(
+                "gpu_requires_real_switch",
+                "GPU 只有在显式真实开关打开后才能选用。",
+                {"device": device},
+            )
+        if not cuda:
+            raise RevisionError(
+                "gpu_unavailable",
+                "要求使用 CUDA，但这台机器没有可用 GPU。",
+                {"cuda": cuda, "bf16": bf16},
+            )
+        if not bf16:
+            raise RevisionError(
+                "bf16_required",
+                "CUDA 上的公平对比只用 bf16。不改用 fp16，也不默认某张卡。",
+                {"cuda": cuda, "bf16": bf16, "assumed_gpu": None},
+            )
+        plan["autocast"] = "bf16"
+        plan["launch"] = "train"
         return plan
-    if not cuda or not bf16:
-        raise RevisionError(
-            "bf16_required",
-            "真实公平对比只在支持 bf16 的 CUDA 上运行。不默认某种 GPU，也不改用 fp16。",
-            {"cuda": cuda, "bf16": bf16, "assumed_gpu": None},
-        )
-    plan["autocast"] = "bf16"
-    plan["launch"] = "checks_passed_trainer_not_in_this_revision"
+    plan["autocast"] = "fp32"
+    plan["launch"] = "train" if real else "cpu_smoke"
     return plan

@@ -8,7 +8,6 @@ import numpy as np
 from revision.fair_config import training_matrix
 from revision.identity import (
     B2_CONTROL_BINARY_VAL,
-    STAGE_E_CONTROL_BINARY_VAL,
     RevisionError,
     create_run_dir,
     verify_identity,
@@ -55,20 +54,25 @@ def main(argv=None):
         create_run_dir(out, run_name)
     except RevisionError as exc:
         emit(exc.code)
-    expect = {
-        "role": "stage_e_control",
-        "backbone_id": "innerlogic_surg_vitb16",
-        "geometry": "square768",
-        "best_val_dice": STAGE_E_CONTROL_BINARY_VAL,
-        "metric_name": "binary_foreground_dice",
-    }
     try:
         verify_identity(
-            {"filename": "best_control.pt", "epoch": 3, "best_val_dice": B2_CONTROL_BINARY_VAL},
-            expect,
+            {
+                "filename": "best_control.pt",
+                "epoch": 3,
+                "best_val_dice": B2_CONTROL_BINARY_VAL,
+                "role": "control_head",
+            },
+            {
+                "role": "stage_e_control",
+                "backbone_id": "innerlogic_surg_vitb16",
+                "geometry": "square768",
+                "ckpt_kind": "control_head",
+            },
         )
     except RevisionError as exc:
         emit(exc.code)
+        for warning in exc.details.get("warnings", []):
+            emit(warning)
     try:
         resolve_backbone("innerlogic_surg_vitb16", out / "missing-ils.pth")
     except RevisionError as exc:

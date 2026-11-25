@@ -41,6 +41,15 @@ from revision.overlays import (  # noqa: E402
     WRONG_COLOR,
     write_review,
 )
+from revision.engine import (  # noqa: E402
+    TinyDino,
+    infer_checkpoint,
+    launch_real,
+    make_head,
+    run_synthetic_demo,
+    train,
+)
+from revision.preflight import assert_output_ready  # noqa: E402
 from revision.pretrain import ILS_SHA256, decide_weight, resolve_backbone  # noqa: E402
 
 
@@ -230,41 +239,51 @@ class OverlayTests(unittest.TestCase):
 
 
 class IdentityTests(unittest.TestCase):
-    def test_b2_head_is_not_stage_e_control(self):
+    def test_b2_scalar_warns_and_sha_decides(self):
         record = {
             "filename": "best_control.pt",
             "epoch": 3,
             "best_val_dice": B2_CONTROL_BINARY_VAL,
-            "role": "control",
-        }
-        expect = {
-            "role": "stage_e_control",
+            "role": "control_head",
+            "ckpt_kind": "control_head",
             "backbone_id": "innerlogic_surg_vitb16",
             "geometry": "square768",
-            "best_val_dice": STAGE_E_CONTROL_BINARY_VAL,
-            "metric_name": "binary_foreground_dice",
+            "sha256": "user-recorded-sha",
+            "embed_dim": 768,
+            "num_classes": 7,
+            "train_mode": "frozen_probe",
         }
+        accepted = verify_identity(record, dict(record))
+        self.assertTrue(accepted["accepted"])
+        self.assertIn("historical_b2_scalar", accepted["warnings"])
         with self.assertRaises(RevisionError) as ctx:
-            verify_identity(record, expect)
-        self.assertEqual(ctx.exception.code, "known_wrong_head")
-        self.assertAlmostEqual(ctx.exception.details["found_best_val_dice"], B2_CONTROL_BINARY_VAL)
-        self.assertAlmostEqual(ctx.exception.details["expected_best_val_dice"], STAGE_E_CONTROL_BINARY_VAL)
+            verify_identity(dict(record, sha256="other"), record)
+        self.assertEqual(ctx.exception.code, "hash_mismatch")
+        self.assertIn("historical_b2_scalar", ctx.exception.details["warnings"])
+        with self.assertRaises(RevisionError) as ctx:
+            verify_identity(dict(record, ckpt_kind="full_finetune"), record)
+        self.assertEqual(ctx.exception.code, "ckpt_kind_mismatch")
 
-    def test_matching_stage_e_scalar_without_pinned_bytes_fails(self):
+    def test_user_recorded_sha_does_not_need_a_repo_pin(self):
         record = {
             "filename": "best_control.pt",
             "role": "stage_e_control",
+            "ckpt_kind": "control_head",
             "backbone_id": "innerlogic_surg_vitb16",
             "geometry": "square768",
             "epoch": 3,
             "best_val_dice": STAGE_E_CONTROL_BINARY_VAL,
-            "metric_name": "binary_foreground_dice",
-            "sha256": "abc",
-            "head_init": "random",
+            "sha256": "recorded-locally",
+            "embed_dim": 768,
+            "num_classes": 7,
+            "train_mode": "frozen_probe",
         }
+        accepted = verify_identity(record, dict(record))
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["warnings"], [])
         with self.assertRaises(RevisionError) as ctx:
-            verify_identity(record, dict(record))
-        self.assertEqual(ctx.exception.code, "unverified_historical_head")
+            verify_identity(record, {"ckpt_kind": "control_head"})
+        self.assertEqual(ctx.exception.code, "expected_sha_required")
 
     def test_fair_identity_and_resume(self):
         good = {
@@ -273,7 +292,7 @@ class IdentityTests(unittest.TestCase):
             "geometry": "square768",
             "epoch": 2,
             "best_val_dice": 0.5,
-            "metric_name": "frame_equal_mean_gt_class_dice",
+            "metric_name": "binary_foreground_dice_frame_equal",
             "sha256": "deadbeef",
             "head_init": "random",
             "seed": 7,
@@ -332,6 +351,9 @@ class PretrainAndConfigTests(unittest.TestCase):
             decide_weight("dinov3_vitb16_lvd1689m", ILS_SHA256)
         self.assertEqual(ctx.exception.code, "backbone_substitution")
         with self.assertRaises(RevisionError) as ctx:
+            decide_weight("dinov3_vitb16_lvd1689m", ILS_SHA256, expected_sha=ILS_SHA256)
+        self.assertEqual(ctx.exception.code, "backbone_substitution")
+        with self.assertRaises(RevisionError) as ctx:
             decide_weight("dinov3_vitb16_lvd1689m", "f" * 64)
         self.assertEqual(ctx.exception.code, "weight_unverified")
         with self.assertRaises(RevisionError) as ctx:
@@ -349,6 +371,12 @@ class PretrainAndConfigTests(unittest.TestCase):
                 resolve_backbone("dinov3_vitb16_lvd1689m", blob)
             self.assertEqual(ctx.exception.code, "weight_unverified")
             self.assertFalse(ctx.exception.details.get("weights_loaded", False))
+            digest = __import__("hashlib").sha256(blob.read_bytes()).hexdigest()
+            accepted = resolve_backbone(
+                "dinov3_vitb16_lvd1689m", blob, expected_sha=digest)
+            self.assertTrue(accepted["hash_accepted"])
+            self.assertFalse(accepted["weights_loaded"])
+            self.assertEqual(accepted["source"], "user_manifest")
 
     def test_matrix_is_four_square768_runs_until_triple_seed(self):
         runs = training_matrix(phase="single", seed=7)
@@ -365,7 +393,8 @@ class PretrainAndConfigTests(unittest.TestCase):
             self.assertEqual(r["microbatch"], 1)
             self.assertEqual(r["grad_accum"], 8)
             self.assertEqual(r["selection_split"], "val")
-            self.assertEqual(r["selection_score"], "frame_equal_mean_gt_class_dice")
+            self.assertEqual(r["selection_score"], "binary_foreground_dice_frame_equal")
+            self.assertIn("gt_class_dice", r["reported_but_not_used_for_selection"])
             self.assertEqual(r["head_init"], "random")
             self.assertFalse(r["early_stop"])
             self.assertEqual(r["seeds"], [7])
@@ -383,12 +412,18 @@ class PretrainAndConfigTests(unittest.TestCase):
         plan = runtime_plan(real=False, cuda=False, bf16=False)
         self.assertIsNone(plan["assumed_gpu"])
         self.assertEqual(plan["effective_batch"], 8)
+        self.assertEqual(plan["launch"], "cpu_smoke")
+        self.assertEqual(plan["device"], "cpu")
+        cpu_real = runtime_plan(real=True, cuda=True, bf16=True)
+        self.assertEqual(cpu_real["device"], "cpu")
+        self.assertEqual(cpu_real["launch"], "train")
+        self.assertEqual(cpu_real["autocast"], "fp32")
         with self.assertRaises(RevisionError) as ctx:
-            runtime_plan(real=True, cuda=True, bf16=False)
+            runtime_plan(real=True, cuda=True, bf16=False, device="cuda")
         self.assertEqual(ctx.exception.code, "bf16_required")
-        real = runtime_plan(real=True, cuda=True, bf16=True)
+        real = runtime_plan(real=True, cuda=True, bf16=True, device="cuda")
         self.assertEqual(real["autocast"], "bf16")
-        self.assertEqual(real["launch"], "checks_passed_trainer_not_in_this_revision")
+        self.assertEqual(real["launch"], "train")
         self.assertIsNone(real["assumed_gpu"])
 
     def test_historical_eval_script_is_unchanged_evidence(self):
@@ -424,12 +459,198 @@ class SmokeAndNotebookTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             log = proc.stdout + "\n" + (Path(td).joinpath("smoke.log").read_text())
-            self.assertIn("known_wrong_head", log)
+            self.assertIn("expected_sha_required", log)
+            self.assertIn("historical_b2_scalar", log)
             self.assertIn("nonoverwrite", log)
             self.assertIn("weight_missing", log)
             self.assertIn("binary_foreground_dice", log)
             self.assertIn("gt_class_dice", log)
             self.assertNotIn("weights_loaded=True", log)
+
+
+class TrainTests(unittest.TestCase):
+    def test_synthetic_four_configs_resume_and_infer(self):
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            summary = run_synthetic_demo(parent, optimizer_steps=2)
+            self.assertEqual(len(summary["configs"]), 4)
+            modes = {item["train_mode"] for item in summary["configs"]}
+            self.assertEqual(modes, {"frozen_probe", "last4_finetune"})
+            for item in summary["configs"]:
+                self.assertEqual(item["backward_passes"], 8)
+                self.assertEqual(item["optimizer_steps"], 1)
+                self.assertTrue(item["synthetic_backbone"])
+                self.assertEqual(item["selection_metric"], "binary_foreground_dice_frame_equal")
+                probe = item["grad_probe"]
+                self.assertTrue(probe["head_has_grad"])
+                self.assertFalse(probe["early_requires_grad"])
+                self.assertFalse(probe["early_blocks_have_grad"])
+                if item["train_mode"] == "frozen_probe":
+                    self.assertFalse(probe["last4_requires_grad"])
+                    self.assertFalse(probe["last4_have_grad"])
+                else:
+                    self.assertTrue(probe["last4_requires_grad"])
+                    self.assertTrue(probe["last4_have_grad"])
+            self.assertTrue(summary["resume_match"])
+            infer = summary["infer"]
+            self.assertEqual(infer["ckpt_kind"], "control_head")
+            self.assertIn("historical_b2_scalar", infer["warnings"])
+            payload = json.loads((Path(infer["out_dir"]) / "frames.json").read_text())
+            frame = payload["frames"][0]
+            self.assertEqual(frame["patient"], "synth-patient")
+            self.assertEqual(frame["coordinates"]["crop_box_original_xyxy"], [4, 0, 16, 12])
+            self.assertEqual(frame["coordinates"]["original_hw"], [12, 20])
+            self.assertEqual(frame["coordinates"]["class_id_crop_hw"], [12, 12])
+            self.assertAlmostEqual(frame["scores"]["binary_foreground_dice"], 0.0)
+            err = np.array(Image.open(Path(infer["out_dir"]) / "frame0000_error_map.png"))
+            self.assertTrue(np.any(np.all(err == FN_COLOR, axis=-1)))
+            canvas = np.array(Image.open(Path(infer["out_dir"]) / "frame0000_pred_class_id_original.png"))
+            self.assertEqual(canvas.shape, (12, 20))
+            self.assertEqual(int(canvas[0, 0]), 255)
+            self.assertEqual(int(canvas[0, 4]), 0)
+
+    def test_val_selection_ignores_semantic_and_test(self):
+        scores = iter([
+            {"binary_foreground_dice": 0.2, "gt_class_dice": 0.99, "frames": []},
+            {"binary_foreground_dice": 0.85, "gt_class_dice": 0.01, "frames": []},
+        ])
+
+        def stub(backbone, head, rows, split, **_kwargs):
+            self.assertEqual(split, "val")
+            return next(scores)
+
+        base = training_matrix_one()
+        with tempfile.TemporaryDirectory() as td:
+            result = train(
+                base,
+                _rows("train"),
+                _rows("val"),
+                TinyDino(),
+                Path(td),
+                "fairrun-select",
+                device="cpu",
+                max_optimizer_steps=2,
+                val_every="optimizer_step",
+                evaluate_fn=stub,
+            )
+            self.assertEqual(result["best_step"], 2)
+            self.assertAlmostEqual(result["best_val_binary_foreground_dice"], 0.85)
+            with self.assertRaises(RevisionError) as ctx:
+                train(
+                    base, _rows("local_test"), _rows("val"), TinyDino(),
+                    Path(td), "fairrun-leak", device="cpu", max_optimizer_steps=1,
+                )
+            self.assertEqual(ctx.exception.code, "test_leak")
+
+    def test_real_entry_fail_fast(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with self.assertRaises(RevisionError) as ctx:
+                assert_output_ready(root / "out", min_free_bytes=10 ** 18)
+            self.assertEqual(ctx.exception.code, "disk_insufficient")
+            with self.assertRaises(RevisionError) as ctx:
+                assert_output_ready(root / "missing-parent" / "out", min_free_bytes=1)
+            self.assertEqual(ctx.exception.code, "not_writable")
+            with self.assertRaises(RevisionError) as ctx:
+                launch_real(
+                    backbone_id="innerlogic_surg_vitb16",
+                    weight_path=root / "no-weight.pth",
+                    expected_sha="abc",
+                    data_root=root,
+                    manifest=root / "m.jsonl",
+                    out_dir=root,
+                    train_mode="frozen_probe",
+                    device="cpu",
+                    min_free_bytes=1,
+                )
+            self.assertEqual(ctx.exception.code, "weight_missing")
+            blob = root / "fake.pth"
+            blob.write_bytes(b"not-a-backbone")
+            digest = __import__("hashlib").sha256(blob.read_bytes()).hexdigest()
+            data = root / "data"
+            data.mkdir()
+            manifest = root / "m.jsonl"
+            manifest.write_text(
+                '{"image":"a.png","mask":"a.png","cls":"drill","patient":"p","split":"train"}\n'
+                '{"image":"b.png","mask":"b.png","cls":"drill","patient":"q","split":"val"}\n'
+            )
+            with self.assertRaises(RevisionError) as ctx:
+                launch_real(
+                    backbone_id="dinov3_vitb16_lvd1689m",
+                    weight_path=blob,
+                    expected_sha=digest,
+                    data_root=data,
+                    manifest=manifest,
+                    out_dir=root,
+                    train_mode="last4_finetune",
+                    device="cpu",
+                    min_free_bytes=1,
+                )
+            self.assertEqual(ctx.exception.code, "backbone_loader_missing")
+            self.assertIn("surgfm_probe", str(ctx.exception))
+            with self.assertRaises(RevisionError) as ctx:
+                launch_real(
+                    backbone_id="innerlogic_surg_vitb16",
+                    weight_path=blob,
+                    expected_sha=digest,
+                    data_root=data,
+                    manifest=manifest,
+                    out_dir=root,
+                    train_mode="frozen_probe",
+                    device="cuda",
+                    min_free_bytes=1,
+                )
+            self.assertEqual(ctx.exception.code, "gpu_unavailable")
+
+            head = make_head(8, 7, seed=0)
+            net = TinyDino()
+            path = root / "full.pt"
+            torch_save(path, {
+                "head_state": head.state_dict(),
+                "backbone_state": net.state_dict(),
+                "best_val_dice": 0.2,
+                "embed_dim": 8,
+                "num_classes": 7,
+                "depth": 12,
+                "patch_size": 4,
+                "geometry": "square768",
+                "train_mode": "last4_finetune",
+                "role": "last4",
+                "backbone_id": "synthetic_tiny",
+            })
+            expect = {
+                "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+                "ckpt_kind": "control_head",
+                "embed_dim": 8,
+                "num_classes": 7,
+            }
+            with self.assertRaises(RevisionError) as ctx:
+                infer_checkpoint(
+                    path, expect, _rows("val"), net, make_head(8, 7, seed=1),
+                    root / "fairrun-bad-infer", device="cpu", input_size=16, patch=4,
+                )
+            self.assertEqual(ctx.exception.code, "ckpt_kind_mismatch")
+
+
+def training_matrix_one():
+    from revision.fair_config import training_matrix
+    from revision.engine import synthetic_config
+    return synthetic_config(training_matrix()[0])
+
+
+def _rows(split):
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    mask = np.zeros((16, 16), dtype=np.uint8)
+    mask[4:12, 4:12] = 255
+    return [{
+        "image": image, "mask": mask, "cls": "grasping forceps",
+        "patient": "synth", "split": split,
+    }]
+
+
+def torch_save(path, blob):
+    import torch
+    torch.save(blob, path)
 
 
 if __name__ == "__main__":

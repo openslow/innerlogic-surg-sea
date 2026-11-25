@@ -5,16 +5,10 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-# 这两个标量都是历史 binary foreground val Dice，不是 class-aware。
-# Stage E control 的正确权重字节尚未钉死，因此即使标量吻合也不能接受。
+# 这两个标量都是历史 binary foreground val Dice，不是 class-aware，也不是身份。
+# 接近 B2 标量时只警告。身份看调用方本地记录的 sha256、架构和 ckpt 种类。
 B2_CONTROL_BINARY_VAL = 0.8682456
 STAGE_E_CONTROL_BINARY_VAL = 0.9394298
-
-_REQUIRED = (
-    "role", "backbone_id", "geometry", "epoch", "best_val_dice",
-    "metric_name", "sha256", "head_init",
-)
-
 
 class RevisionError(Exception):
     def __init__(self, code, message, details=None):
@@ -30,64 +24,72 @@ def _close(a, b, tol=1e-6):
         return False
 
 
+_COMPARE_KEYS = (
+    "role", "backbone_id", "geometry", "embed_dim", "depth",
+    "patch_size", "num_classes", "train_mode",
+)
+
+
 def verify_identity(record, expect):
-    """对照 manifest 期望检查 checkpoint 记录。`filename` 不参与认定。"""
-    found = record.get("best_val_dice")
-    expected_val = expect.get("best_val_dice", STAGE_E_CONTROL_BINARY_VAL)
-    if _close(found, B2_CONTROL_BINARY_VAL) and (
-        expect.get("role") == "stage_e_control"
-        or _close(expected_val, STAGE_E_CONTROL_BINARY_VAL)
-    ):
+    """身份是期望 sha256、张量架构和 ckpt 种类。best_val 标量只作历史警告。"""
+    warnings = []
+    if _close(record.get("best_val_dice"), B2_CONTROL_BINARY_VAL):
+        warnings.append("historical_b2_scalar")
+    if not expect.get("sha256"):
         raise RevisionError(
-            "known_wrong_head",
-            "best_val_dice 0.8682456 是旧 B2（epoch 3，stretch 768x432）的头，"
-            "不是 Stage E control（binary val 0.9394298）。文件名 best_control.pt 不能当作身份。",
-            {
-                "found_best_val_dice": float(found),
-                "expected_best_val_dice": float(expected_val),
-                "filename_ignored": record.get("filename"),
-            },
+            "expected_sha_required",
+            "调用方要在本地 manifest 写上合法取得的权重 sha256。仓库不预存私有文件哈希，"
+            "也不用 best_val 标量认定身份。",
+            {"warnings": warnings, "filename_ignored": record.get("filename")},
         )
-    missing = [key for key in _REQUIRED if key not in record or record[key] in (None, "")]
-    if missing:
+    if not record.get("sha256"):
         raise RevisionError(
             "incomplete_metadata",
-            "checkpoint 缺少身份字段，拒绝按文件名加载：" + ", ".join(missing),
-            {"missing": missing, "filename_ignored": record.get("filename")},
+            "checkpoint 没有 sha256，拒绝按文件名或 best_val 加载。",
+            {"warnings": warnings, "missing": ["sha256"], "filename_ignored": record.get("filename")},
         )
-    if record.get("role") == "stage_e_control" or expect.get("role") == "stage_e_control":
-        raise RevisionError(
-            "unverified_historical_head",
-            "Stage E control 的正确 head 还没有可核对的 sha256。标量吻合不够，拒绝加载。",
-            {"best_val_dice": record.get("best_val_dice"), "filename_ignored": record.get("filename")},
-        )
-    if record.get("geometry") != expect.get("geometry"):
-        raise RevisionError(
-            "geometry_mismatch",
-            f"几何不一致：checkpoint={record.get('geometry')} expect={expect.get('geometry')}",
-            {"found": record.get("geometry"), "expected": expect.get("geometry")},
-        )
-    if record.get("sha256") != expect.get("sha256"):
+    if str(record["sha256"]).lower() != str(expect["sha256"]).lower():
         raise RevisionError(
             "hash_mismatch",
-            "checkpoint sha256 与 manifest 不一致",
-            {"found": record.get("sha256"), "expected": expect.get("sha256")},
+            "checkpoint sha256 与本地 manifest 的期望值不一致",
+            {"warnings": warnings, "found": record.get("sha256"), "expected": expect.get("sha256")},
         )
-    for key in ("role", "backbone_id", "metric_name", "head_init"):
-        if record.get(key) != expect.get(key):
+    if "ckpt_kind" in expect and record.get("ckpt_kind") != expect.get("ckpt_kind"):
+        raise RevisionError(
+            "ckpt_kind_mismatch",
+            "full finetune（含 backbone_state）和 control head（只有 head_state）不能混用。",
+            {
+                "warnings": warnings,
+                "found": record.get("ckpt_kind"),
+                "expected": expect.get("ckpt_kind"),
+            },
+        )
+    for key in _COMPARE_KEYS:
+        if expect.get(key) in (None, ""):
+            continue
+        if record.get(key) in (None, ""):
+            if key == "geometry":
+                warnings.append("geometry_not_in_checkpoint")
+                continue
             raise RevisionError(
-                "metadata_mismatch",
-                f"{key} 不一致",
-                {"key": key, "found": record.get(key), "expected": expect.get(key)},
+                "incomplete_metadata",
+                f"checkpoint 缺少 {key}",
+                {"warnings": warnings, "missing": [key]},
             )
-    if "epoch" in expect and record.get("epoch") != expect.get("epoch"):
-        raise RevisionError("metadata_mismatch", "epoch 不一致", {"key": "epoch"})
-    if not _close(record.get("best_val_dice"), expect.get("best_val_dice")):
-        raise RevisionError("metadata_mismatch", "best_val_dice 不一致", {"key": "best_val_dice"})
-    accepted = {key: record[key] for key in _REQUIRED}
-    accepted["accepted"] = True
-    accepted["filename_ignored"] = record.get("filename")
-    return accepted
+        if record.get(key) != expect.get(key):
+            code = "geometry_mismatch" if key == "geometry" else "metadata_mismatch"
+            raise RevisionError(
+                code,
+                f"{key} 不一致",
+                {"warnings": warnings, "key": key, "found": record.get(key), "expected": expect.get(key)},
+            )
+    return {
+        "accepted": True,
+        "warnings": warnings,
+        "sha256": str(record["sha256"]).lower(),
+        "ckpt_kind": record.get("ckpt_kind"),
+        "filename_ignored": record.get("filename"),
+    }
 
 
 def plan_resume(record, config):

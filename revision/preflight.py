@@ -1,7 +1,10 @@
 """环境预检。不挂载外部存储，不启动训练。"""
+import os
 import shutil
 import socket
 from pathlib import Path
+
+from revision.identity import RevisionError
 
 
 def environment_report(path="."):
@@ -31,3 +34,23 @@ def environment_report(path="."):
         "gpu_name": gpu_name,
         "torch": torch_version,
     }
+
+
+def assert_output_ready(path, min_free_bytes):
+    """真实写出之前检查目录可写、剩余空间够。不够就停，不创建半套结果。"""
+    target = Path(path)
+    parent = target if target.exists() else target.parent
+    if not parent.exists() or not os.access(parent, os.W_OK):
+        raise RevisionError(
+            "not_writable",
+            f"输出路径不可写：{target}",
+            {"path": str(target)},
+        )
+    free = shutil.disk_usage(parent).free
+    if free < int(min_free_bytes):
+        raise RevisionError(
+            "disk_insufficient",
+            f"剩余 {free} 字节，需要至少 {int(min_free_bytes)} 字节。",
+            {"path": str(target), "free": int(free), "required": int(min_free_bytes)},
+        )
+    return {"path": str(target), "free": int(free)}

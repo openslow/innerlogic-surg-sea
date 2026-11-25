@@ -16,7 +16,8 @@ foreground（`pred != 0`），不是 class-aware Dice。clean22 是 old100 里�
 新训练集的子集，不是独立测试集。冻结骨干再监督训练 head 不是 zero-shot。
 ep10 微调预算长于 Stage E control，且 B–D 用的是 768×432 stretch。
 名为 `best_control.pt`、binary val 0.8682456 的文件是旧 B2，不是 Stage E
-control（0.9394298）；正确 head 未钉死 sha 之前会 fail-fast。
+control（0.9394298）。标量只作警告；身份是本地记录的 sha256、架构和
+control head / full finetune 种类。
 逐帧 control JSON 的体积路径是 `results_e/results_control.json`，本仓库不收录该文件。
 口径、四组公平配置和 Colab 入口见 `docs/REVISION_2026-11-25.md` 与
 `notebooks/fair_comparison_entry.ipynb`。历史训练脚本未改。
@@ -62,10 +63,10 @@ project Drive folder (see below). This repo is code only.
 - A file named `best_control.pt` is **not an identity**. The head-only 68 KB
   note in earlier notes referred to a frozen-backbone head; the copy whose
   binary val Dice is 0.8682456 is the old B2 epoch-3 stretch head, not the
-  Stage E control (binary val 0.9394298). Do not call that supervised head
-  zero-shot. Rebuilding either head still needs the matching pretrain weight
-  and a manifest (`checkpoints/MANIFEST.md` on Drive). This repo fails closed
-  until that metadata matches. See `docs/REVISION_2026-11-25.md`.
+  Stage E control (binary val 0.9394298). That scalar is a warning only.
+  Identity is a locally recorded sha256 plus architecture and whether the file
+  is a control head or a full finetune checkpoint. Do not call that supervised
+  head zero-shot. See `docs/REVISION_2026-11-25.md`.
 - Never fp16; always bf16 autocast.
 
 ## Recipe (final, Stage E)

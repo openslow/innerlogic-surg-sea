@@ -28,15 +28,35 @@ _STEPS = {
 }
 
 
-def decide_weight(backbone_id, sha256):
-    """只根据骨干 id 和 sha256 决定。不读张量。"""
+def decide_weight(backbone_id, sha256, expected_sha=None):
+    """只根据骨干 id 和 sha256 决定。不读张量，也不下载。
+
+    调用方可以在本地 manifest 写入合法取得的 expected_sha。仓库不必事先存有
+    该私有文件的哈希。未提供期望值时，InnerLogic 仍核对公开 pin；通用 DINOv3
+    因为许可证门控且没有核到的 pin，真实加载会拒绝，合成骨干测试不走这里。
+    """
     sha = str(sha256).lower()
+    steps = _STEPS.get(backbone_id, "未知骨干，没有获取步骤。")
     if backbone_id == "dinov3_vitb16_lvd1689m" and sha == ILS_SHA256:
         raise RevisionError(
             "backbone_substitution",
             "这个文件是 InnerLogic-Surg ViT-B/16，不能当作通用 DINOv3 LVD 骨干。",
-            {"weights_loaded": False, "steps_zh": _STEPS[backbone_id], "sha256": sha},
+            {"weights_loaded": False, "steps_zh": steps, "sha256": sha},
         )
+    if expected_sha not in (None, ""):
+        if sha != str(expected_sha).lower():
+            raise RevisionError(
+                "hash_mismatch",
+                "文件 sha256 与本地 manifest 里记录的期望值不一致。",
+                {"weights_loaded": False, "steps_zh": steps, "sha256": sha},
+            )
+        return {
+            "hash_accepted": True,
+            "weights_loaded": False,
+            "sha256": sha,
+            "backbone_id": backbone_id,
+            "source": "user_manifest",
+        }
     if backbone_id == "innerlogic_surg_vitb16":
         if sha == ILS_SHA256:
             return {
@@ -44,17 +64,21 @@ def decide_weight(backbone_id, sha256):
                 "weights_loaded": False,
                 "sha256": sha,
                 "backbone_id": backbone_id,
+                "source": "public_pin",
             }
         raise RevisionError(
             "hash_mismatch",
-            "InnerLogic-Surg ViT-B/16 的 sha256 与已钉死的 a516a775… 不一致。",
-            {"weights_loaded": False, "steps_zh": _STEPS[backbone_id], "sha256": sha},
+            "InnerLogic-Surg ViT-B/16 与公开 pin a516a775… 不一致。"
+            "若这是另一份合法权重，把 sha256 写进本地 manifest 再传入 expected_sha。",
+            {"weights_loaded": False, "steps_zh": steps, "sha256": sha},
         )
     if backbone_id == "dinov3_vitb16_lvd1689m":
         raise RevisionError(
             "weight_unverified",
-            "通用 DINOv3 ViT-B/16 的 sha256 尚未钉死，拒绝加载，也不改用 InnerLogic 权重。",
-            {"weights_loaded": False, "steps_zh": _STEPS[backbone_id], "sha256": sha},
+            "通用 DINOv3 ViT-B/16 没有可核的公开 sha256，且权重在许可证门控之后才能下载。"
+            "把本地文件的 sha256 写入 manifest 并传入 expected_sha 后再加载。"
+            "不要用 InnerLogic 文件顶替。合成训练不需要这份权重。",
+            {"weights_loaded": False, "steps_zh": steps, "sha256": sha},
         )
     raise RevisionError(
         "unknown_backbone",
@@ -63,7 +87,7 @@ def decide_weight(backbone_id, sha256):
     )
 
 
-def resolve_backbone(backbone_id, path):
+def resolve_backbone(backbone_id, path, expected_sha=None):
     steps = _STEPS.get(backbone_id, "未知骨干，没有获取步骤。")
     file_path = Path(path) if path else None
     if file_path is None or not file_path.is_file():
@@ -73,4 +97,4 @@ def resolve_backbone(backbone_id, path):
             {"weights_loaded": False, "steps_zh": steps, "path": None if file_path is None else str(file_path)},
         )
     digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
-    return decide_weight(backbone_id, digest)
+    return decide_weight(backbone_id, digest, expected_sha=expected_sha)
